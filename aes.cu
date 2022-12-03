@@ -20,6 +20,8 @@
 
 using byte = uint8_t;
 using namespace std;
+byte* device_sbox;
+byte* device_inv_sbox;
 
 const byte sbox[256] = { // SubBytes 모듈에 필요한 테이블
     0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
@@ -40,7 +42,7 @@ const byte sbox[256] = { // SubBytes 모듈에 필요한 테이블
     0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16 
 };
 
-const byte inv_sbox[256] = { I // InvSubBytes 모듈에 필요한 테이블
+const byte inv_sbox[256] = { // InvSubBytes 모듈에 필요한 테이블
     0x52, 0x09, 0x6a, 0xd5, 0x30, 0x36, 0xa5, 0x38, 0xbf, 0x40, 0xa3, 0x9e, 0x81, 0xf3, 0xd7, 0xfb,
     0x7c, 0xe3, 0x39, 0x82, 0x9b, 0x2f, 0xff, 0x87, 0x34, 0x8e, 0x43, 0x44, 0xc4, 0xde, 0xe9, 0xcb,
     0x54, 0x7b, 0x94, 0x32, 0xa6, 0xc2, 0x23, 0x3d, 0xee, 0x4c, 0x95, 0x0b, 0x42, 0xfa, 0xc3, 0x4e,
@@ -59,25 +61,32 @@ const byte inv_sbox[256] = { I // InvSubBytes 모듈에 필요한 테이블
     0x17, 0x2b, 0x04, 0x7e, 0xba, 0x77, 0xd6, 0x26, 0xe1, 0x69, 0x14, 0x63, 0x55, 0x21, 0x0c, 0x7d
 };
 
-const byte rcon[11] = { // Round Key 생성 시(Key Expansion) 필요한 테이블
-    0xFF, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36
-};
+// const byte rcon[11] = { // Round Key 생성 시(Key Expansion) 필요한 테이블
+//     0xFF, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36
+// };
 
-__global__ void AddRoundKey(byte* state, byte* key){
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    byte ret = state[idx] ^ key[idx];   
+__global__ void AddRoundKey(byte* plaintext, byte* key){
+    // int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int idx = (blockDim.x * blockDim.y) * blockIdx.x + threadIdx.y * blockDim.y + threadIdx.x;
+    byte ret = plaintext[idx] ^ key[idx];   
     // __syncthreads();
-    state[idx] = ret;
+    plaintext[idx] = ret;
+}
+
+__global__ void SubBytes(byte* plaintext, byte* sbox){
+    int idx = (blockDim.x * blockDim.y) * blockIdx.x + threadIdx.y * blockDim.y + threadIdx.x;
+    byte ret = sbox[plaintext[idx]];
+    plaintext[idx] = ret;
 }
 
 int main(){
     byte* plaintext;
     byte* key;
-    byte* state;
+    // byte* state;
 
     plaintext = (byte *) malloc(sizeof(byte) * STATE_SIZE * STATE_COUNT);
     key = (byte *) malloc(sizeof(byte) * KEY_SIZE);
-    state = (byte *) malloc(sizeof(byte) * STATE_SIZE);
+    // state = (byte *) malloc(sizeof(byte) * STATE_SIZE);
     // key 생성
     for(int i = 0;i < KEY_SIZE;i++){
         byte b = (byte) (rand() % 256);
@@ -95,25 +104,32 @@ int main(){
         printf("%d: %#x\n", i, plaintext[i]);
     }
     
-    byte* device_state;
+    byte* device_plaintext;
     byte* device_round_key;
-    CUDA_CHECK(cudaMalloc((void **) &device_state, sizeof(byte) * STATE_SIZE * STATE_COUNT));
+    CUDA_CHECK(cudaMalloc((void **) &device_plaintext, sizeof(byte) * STATE_SIZE * STATE_COUNT));
     CUDA_CHECK(cudaMalloc((void **) &device_round_key, sizeof(byte) * KEY_SIZE));
+    CUDA_CHECK(cudaMalloc((void **) &device_sbox, sizeof(byte) * 256));
+    CUDA_CHECK(cudaMalloc((void **) &device_inv_sbox, sizeof(byte) * 256));
+
 
     CUDA_CHECK(cudaMemcpy(device_round_key, key, sizeof(byte) * KEY_SIZE, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(device_state, plaintext, sizeof(byte) * STATE_SIZE, cudaMemcpyHostToDevice));
-    AddRoundKey<<<1, STATE_SIZE>>>(device_state, device_round_key);
-    
-    CUDA_CHECK(cudaMemcpy(state, device_state, sizeof(byte) * STATE_SIZE, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(device_plaintext, plaintext, sizeof(byte) * STATE_SIZE, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(device_sbox, sbox, sizeof(byte) * 256, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(device_inv_sbox, inv_sbox, sizeof(byte) * 256, cudaMemcpyHostToDevice));
+    dim3 dimBlock(4, 4, 1); // Block당 스레드 수 (4 x 4)16개
+    AddRoundKey<<<1, dimBlock>>>(device_plaintext, device_round_key);
+    SubBytes<<<1, dimBlock>>>(device_plaintext, device_sbox);
+    // SubBytes<<<1, dimBlock>>>(device_plaintext, device_inv_sbox);
+    CUDA_CHECK(cudaMemcpy(plaintext, device_plaintext, sizeof(byte) * STATE_SIZE, cudaMemcpyDeviceToHost));
     for(int i = 0;i < STATE_SIZE;i++){
-        printf("%d: %#x\n", i, state[i]);
+        printf("%d: %#x\n", i, plaintext[i]);
     }
-    AddRoundKey<<<1, STATE_SIZE>>>(device_state, device_round_key);
-    CUDA_CHECK(cudaMemcpy(state, device_state, sizeof(byte) * STATE_SIZE, cudaMemcpyDeviceToHost));
+    AddRoundKey<<<1, dimBlock>>>(device_plaintext, device_round_key);
+    CUDA_CHECK(cudaMemcpy(plaintext, device_plaintext, sizeof(byte) * STATE_SIZE, cudaMemcpyDeviceToHost));
     for(int i = 0;i < STATE_SIZE;i++){
-        printf("%d: %#x\n", i, state[i]);
+        printf("%d: %#x\n", i, plaintext[i]);
     }
-    CUDA_CHECK(cudaFree(device_state));
+    CUDA_CHECK(cudaFree(device_plaintext));
     CUDA_CHECK(cudaFree(device_round_key));
     free(plaintext);
     free(key);
