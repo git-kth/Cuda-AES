@@ -1,4 +1,5 @@
 // AES-128
+
 // AES-128 병렬 컴퓨팅을 이용해서 계산 속도를 올리기.
 // 암호화할 블록 크기 : 128bit (평문을 항상 128bit의 배수로 가정할 것이다, 128bit배수가 아니면 비트를 padding시켜야 하는데 병렬 처리가 목적이니 제외했다.)
 // 암호화하는 블록당 라운드 수 : 10개
@@ -8,7 +9,7 @@
 #include <stdlib.h>
 
 #define ROUND 10 
-#define STATE_COUNT 1 // 암호화할 블록 갯수 (AES에서 암호화할 128bit를 열 우선 행렬로 변환한 행렬을 STATE라고 한다.)
+#define STATE_COUNT 3 // 암호화할 블록 갯수 (AES에서 암호화할 128bit를 열 우선 행렬로 변환한 행렬을 STATE라고 한다.)
 #define STATE_SIZE 16 // state 크기 16byte
 #define KEY_SIZE 16 // 키 크기 16byte
 #define CUDA_CHECK(val) { \
@@ -65,11 +66,24 @@ const byte inv_sbox[256] = { // InvSubBytes 모듈에 필요한 테이블
 //     0xFF, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36
 // };
 
+const byte mix_column_matrix[16] = {
+    0x02, 0x03, 0x01, 0x01,
+    0x01, 0x02, 0x03, 0x01,
+    0x01, 0x01, 0x02, 0x03,
+    0x03, 0x01, 0x01, 0x02
+};
+
+const byte inv_mix_column_matrix[16] = {
+    0x0E, 0x0B, 0x0D, 0x09,
+    0x09, 0x0E, 0x0B, 0x0D,
+    0x0D, 0x09, 0x0E, 0x0B,
+    0x0B, 0x0D, 0x09, 0x0E
+};
+
 __global__ void AddRoundKey(byte* plaintext, byte* key){
     // int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int idx = (blockDim.x * blockDim.y) * blockIdx.x + threadIdx.y * blockDim.y + threadIdx.x;
     byte ret = plaintext[idx] ^ key[idx];   
-    // __syncthreads();
     plaintext[idx] = ret;
 }
 
@@ -79,10 +93,60 @@ __global__ void SubBytes(byte* plaintext, byte* sbox){
     plaintext[idx] = ret;
 }
 
+__global__ void ShiftRows(byte* plaintext, bool inverse){ // reverse가 True이면 InvShiftRow 모듈이 된다.
+    int idx = (blockDim.x * blockDim.y) * blockIdx.x + threadIdx.y * blockDim.y + threadIdx.x;
+    int value = plaintext[idx];
+    int shift_y;
+    if(inverse) shift_y = (threadIdx.y - threadIdx.x) % 4; // left shift
+    else shift_y = (threadIdx.y + threadIdx.x) % 4; // right shift
+
+    int idx2 = (blockDim.x * blockDim.y) * blockIdx.x + shift_y * blockDim.y + threadIdx.x;
+    // __syncthreads();
+    plaintext[idx2] = value;
+}
+
+__device__ byte GaloisCalc(byte b, int n){ // 갈루아체, GF(2^8)에서 x^n과 연산
+    if(n == 1) return b;
+    return GaloisCalc(b * 2 ^ (b & 0x80 ? 0x1B : 0x00), n - 1); // 곱연산시 2^8이 넘어가면 0x1B와 xor을 하여 overflow방지
+}
+
+__global__ void MixColumns(byte* plaintext, byte* mix_column_matrix){
+    int idx = (blockDim.x * blockDim.y) * blockIdx.x + threadIdx.y * blockDim.y + threadIdx.x;
+    byte ret = 0x00;
+    for(int i = 0;i < 4;i++){
+        byte b1 = mix_column_matrix[threadIdx.x * blockDim.x + i];
+        int idx2 = (blockDim.x * blockDim.y) * blockIdx.x + threadIdx.y * blockDim.y + i;
+        byte b2 = plaintext[idx2];
+        if(b1 == 0x01) ret ^= GaloisCalc(b2, 1);
+        else if(b1 == 0x02) ret ^= GaloisCalc(b2, 2);
+        else if(b1 == 0x03){
+            ret ^= GaloisCalc(b2, 2);
+            ret ^= GaloisCalc(b2, 1);
+        }else if(b1 == 0x09){
+            ret ^= GaloisCalc(b2, 4);
+            ret ^= GaloisCalc(b2, 1);
+        }else if(b1 == 0x0B){
+            ret ^= GaloisCalc(b2, 4);
+            ret ^= GaloisCalc(b2, 2);
+            ret ^= GaloisCalc(b2, 1);
+        }else if(b1 == 0x0D){
+            ret ^= GaloisCalc(b2, 4);
+            ret ^= GaloisCalc(b2, 3);
+            ret ^= GaloisCalc(b2, 1);
+        }else if(b1 == 0x0E){
+            ret ^= GaloisCalc(b2, 4);
+            ret ^= GaloisCalc(b2, 3);
+            ret ^= GaloisCalc(b2, 2);
+        }
+    }
+    // __syncthreads();
+    plaintext[idx] = ret;
+}
+
+
 int main(){
     byte* plaintext;
     byte* key;
-    // byte* state;
 
     plaintext = (byte *) malloc(sizeof(byte) * STATE_SIZE * STATE_COUNT);
     key = (byte *) malloc(sizeof(byte) * KEY_SIZE);
@@ -93,6 +157,21 @@ int main(){
         key[i] = b;
     }
 
+    
+
+    // const byte tmp[32] = {
+    //     0x4d, 0xc6, 0x9b, 0xde,
+    //     0x76, 0x9b, 0xe5, 0x9d,
+    //     0xba, 0x70, 0x51, 0x75,
+    //     0xe3, 0x92, 0x16, 0x74,
+    //     0x8e, 0xb2, 0xdf, 0x2d,
+    //     0x22, 0xf2, 0x80, 0xc5,
+    //     0xdb, 0xdc, 0xf7, 0x1e,
+    //     0x12, 0x92, 0xc1, 0x52 
+    // };
+
+
+
     // 암호화할 평문 생성
     for(int i = 0;i < STATE_COUNT;i++){
         for(int j = 0;j < STATE_SIZE;j++){
@@ -100,74 +179,62 @@ int main(){
             plaintext[i * 16 + j] = b;
         }
     }
-    for(int i = 0;i < STATE_SIZE;i++){
-        printf("%d: %#x\n", i, plaintext[i]);
+    for(int i = 0;i < STATE_SIZE * STATE_COUNT;i++){
+        printf("%#04x ", plaintext[i]);
     }
+    printf("\n");
     
     byte* device_plaintext;
     byte* device_round_key;
+    byte* device_mix_column_matrix;
+    byte* device_inv_mix_column_matrix;
+
     CUDA_CHECK(cudaMalloc((void **) &device_plaintext, sizeof(byte) * STATE_SIZE * STATE_COUNT));
     CUDA_CHECK(cudaMalloc((void **) &device_round_key, sizeof(byte) * KEY_SIZE));
     CUDA_CHECK(cudaMalloc((void **) &device_sbox, sizeof(byte) * 256));
     CUDA_CHECK(cudaMalloc((void **) &device_inv_sbox, sizeof(byte) * 256));
+    CUDA_CHECK(cudaMalloc((void **) &device_mix_column_matrix, sizeof(byte) * 16));
+    CUDA_CHECK(cudaMalloc((void **) &device_inv_mix_column_matrix, sizeof(byte) * 16));
 
 
     CUDA_CHECK(cudaMemcpy(device_round_key, key, sizeof(byte) * KEY_SIZE, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(device_plaintext, plaintext, sizeof(byte) * STATE_SIZE, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(device_plaintext, plaintext, sizeof(byte) * STATE_SIZE * STATE_COUNT, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(device_sbox, sbox, sizeof(byte) * 256, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(device_inv_sbox, inv_sbox, sizeof(byte) * 256, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(device_mix_column_matrix, mix_column_matrix, sizeof(byte) * 16, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(device_inv_mix_column_matrix, inv_mix_column_matrix, sizeof(byte) * 16, cudaMemcpyHostToDevice));
+
     dim3 dimBlock(4, 4, 1); // Block당 스레드 수 (4 x 4)16개
-    AddRoundKey<<<1, dimBlock>>>(device_plaintext, device_round_key);
-    SubBytes<<<1, dimBlock>>>(device_plaintext, device_sbox);
-    // SubBytes<<<1, dimBlock>>>(device_plaintext, device_inv_sbox);
-    CUDA_CHECK(cudaMemcpy(plaintext, device_plaintext, sizeof(byte) * STATE_SIZE, cudaMemcpyDeviceToHost));
-    for(int i = 0;i < STATE_SIZE;i++){
-        printf("%d: %#x\n", i, plaintext[i]);
+    
+    AddRoundKey<<<STATE_COUNT, dimBlock>>>(device_plaintext, device_round_key);
+    SubBytes<<<STATE_COUNT, dimBlock>>>(device_plaintext, device_sbox);
+    ShiftRows<<<STATE_COUNT, dimBlock>>>(device_plaintext, false);
+    MixColumns<<<STATE_COUNT, dimBlock>>>(device_plaintext, device_mix_column_matrix);
+    CUDA_CHECK(cudaMemcpy(plaintext, device_plaintext, sizeof(byte) * STATE_SIZE * STATE_COUNT, cudaMemcpyDeviceToHost));
+    for(int i = 0;i < STATE_SIZE * STATE_COUNT;i++){
+        printf("%#04x ", plaintext[i]);
     }
-    AddRoundKey<<<1, dimBlock>>>(device_plaintext, device_round_key);
-    CUDA_CHECK(cudaMemcpy(plaintext, device_plaintext, sizeof(byte) * STATE_SIZE, cudaMemcpyDeviceToHost));
-    for(int i = 0;i < STATE_SIZE;i++){
-        printf("%d: %#x\n", i, plaintext[i]);
+    printf("\n");
+    MixColumns<<<STATE_COUNT, dimBlock>>>(device_plaintext, device_inv_mix_column_matrix);
+    ShiftRows<<<STATE_COUNT, dimBlock>>>(device_plaintext, true);
+    SubBytes<<<STATE_COUNT, dimBlock>>>(device_plaintext, device_inv_sbox);
+    AddRoundKey<<<STATE_COUNT, dimBlock>>>(device_plaintext, device_round_key);
+    
+    CUDA_CHECK(cudaMemcpy(plaintext, device_plaintext, sizeof(byte) * STATE_SIZE * STATE_COUNT, cudaMemcpyDeviceToHost));
+    for(int i = 0;i < STATE_SIZE * STATE_COUNT;i++){
+        printf("%#04x ", plaintext[i]);
     }
+    printf("\n");
+    
+    
     CUDA_CHECK(cudaFree(device_plaintext));
     CUDA_CHECK(cudaFree(device_round_key));
+    CUDA_CHECK(cudaFree(device_sbox));
+    CUDA_CHECK(cudaFree(device_inv_sbox));
+    CUDA_CHECK(cudaFree(device_mix_column_matrix));
+    CUDA_CHECK(cudaFree(device_inv_mix_column_matrix));
     free(plaintext);
     free(key);
+
+    return 0;
 }
-
-// __global__ void vectorAdd(int *a, int *b, int *c){
-//     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-//     c[idx] = a[idx] + b[idx];
-// }
-
-// int main(){
-
-//     int *h_a;
-//     int *h_b;
-//     int *h_c;
-//     h_a = (int *) malloc(WIDTH * sizeof(int));
-//     h_b = (int *) malloc(WIDTH * sizeof(int));
-//     h_c = (int *) malloc(WIDTH * sizeof(int));
-//     for(int i = 0;i < WIDTH;i++){
-//         h_a[i] = 3;
-//         h_b[i] = 4;
-//     }
-    
-//     int *d_a;
-//     int *d_b;
-//     int *d_c;
-
-//     cudaMalloc((void **) &d_a, WIDTH * sizeof(int));
-//     cudaMalloc((void **) &d_b, WIDTH * sizeof(int));
-//     cudaMalloc((void **) &d_c, WIDTH * sizeof(int));
-
-//     cudaMemcpy(d_a, h_a, WIDTH * sizeof(int), cudaMemcpyHostToDevice);
-//     cudaMemcpy(d_b, h_b, WIDTH * sizeof(int), cudaMemcpyHostToDevice);
-
-//     vectorAdd<<<4, 1>>>(d_a, d_b, d_c);
-//     cudaMemcpy(h_c, d_c, WIDTH * sizeof(int), cudaMemcpyDeviceToHost);
-//     for(int i = 0;i < WIDTH;i++){
-//         cout << h_c[i] << endl;
-//     }
-// }
-
