@@ -9,7 +9,7 @@
 #include <stdlib.h>
 
 #define ROUND 10 
-#define STATE_COUNT 3 // 암호화할 블록 갯수 (AES에서 암호화할 128bit를 열 우선 행렬로 변환한 행렬을 STATE라고 한다.)
+#define STATE_COUNT 1 // 암호화할 블록 갯수 (AES에서 암호화할 128bit를 열 우선 행렬로 변환한 행렬을 STATE라고 한다.)
 #define STATE_SIZE 16 // state 크기 16byte
 #define KEY_SIZE 16 // 키 크기 16byte
 #define CUDA_CHECK(val) { \
@@ -62,9 +62,9 @@ const byte inv_sbox[256] = { // InvSubBytes 모듈에 필요한 테이블
     0x17, 0x2b, 0x04, 0x7e, 0xba, 0x77, 0xd6, 0x26, 0xe1, 0x69, 0x14, 0x63, 0x55, 0x21, 0x0c, 0x7d
 };
 
-// const byte rcon[11] = { // Round Key 생성 시(Key Expansion) 필요한 테이블
-//     0xFF, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36
-// };
+const byte rcon[11] = { // Round Key 생성 시(Key Expansion) 필요한 테이블
+    0xFF, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36
+};
 
 const byte mix_column_matrix[16] = {
     0x02, 0x03, 0x01, 0x01,
@@ -80,10 +80,9 @@ const byte inv_mix_column_matrix[16] = {
     0x0B, 0x0D, 0x09, 0x0E
 };
 
-__global__ void AddRoundKey(byte* plaintext, byte* key){
-    // int idx = blockIdx.x * blockDim.x + threadIdx.x;
+__global__ void AddRoundKey(byte* plaintext, byte* key, int round){
     int idx = (blockDim.x * blockDim.y) * blockIdx.x + threadIdx.y * blockDim.y + threadIdx.x;
-    byte ret = plaintext[idx] ^ key[idx];   
+    byte ret = plaintext[idx] ^ key[round * 16 + idx];   
     plaintext[idx] = ret;
 }
 
@@ -107,13 +106,13 @@ __global__ void ShiftRows(byte* plaintext, bool inverse){ // reverse가 True이�
 
 __device__ byte GaloisCalc(byte b, int n){ // 갈루아체, GF(2^8)에서 x^n과 연산
     if(n == 1) return b;
-    return GaloisCalc(b * 2 ^ (b & 0x80 ? 0x1B : 0x00), n - 1); // 곱연산시 2^8이 넘어가면 0x1B와 xor을 하여 overflow방지
+    return GaloisCalc(b * 2 ^ (b & 0x80 ? 0x1B : 0x00), n - 1); // 곱연산시 2^8이 넘어가면 0x1B와 xor을 하여 overflow 방지
 }
 
 __global__ void MixColumns(byte* plaintext, byte* mix_column_matrix){
     int idx = (blockDim.x * blockDim.y) * blockIdx.x + threadIdx.y * blockDim.y + threadIdx.x;
     byte ret = 0x00;
-    for(int i = 0;i < 4;i++){
+    for(int i = 0;i < 4;i++){ // 갈루아체에서 다항식 행 곱셈
         byte b1 = mix_column_matrix[threadIdx.x * blockDim.x + i];
         int idx2 = (blockDim.x * blockDim.y) * blockIdx.x + threadIdx.y * blockDim.y + i;
         byte b2 = plaintext[idx2];
@@ -143,34 +142,41 @@ __global__ void MixColumns(byte* plaintext, byte* mix_column_matrix){
     plaintext[idx] = ret;
 }
 
+// 라운드마다 적용할 키 생성
+void KeyExpansion(byte* key){
+    for(int i = 1;i < ROUND + 1;i++){
+        int j = i * 16;
+        byte b[4] = {key[j - 1] , key[j - 2], key[j - 3], key[j - 4]};
+        byte tmp = b[0];
+        // rotation 1byte
+        for(int k = 0;k < 3;k++) {
+            b[k] = b[k + 1];
+        }
+        b[3] = tmp;
+        
+        for(int k = 0;k < 4;k++) b[k] = sbox[b[k]];
+        b[0] = b[0] ^ rcon[i];
+
+        key[j] = key[j - 16] ^ b[0];
+        key[j + 1] = key[j - 15] ^ b[1];
+        key[j + 2] = key[j - 14] ^ b[2];
+        key[j + 3] = key[j - 13] ^ b[3];
+        for(int k = 4;k < 16;k++) key[j + k] = key[j + k -16 - 4] ^ key[j + k - 4];
+    }
+}
 
 int main(){
     byte* plaintext;
     byte* key;
 
     plaintext = (byte *) malloc(sizeof(byte) * STATE_SIZE * STATE_COUNT);
-    key = (byte *) malloc(sizeof(byte) * KEY_SIZE);
-    // state = (byte *) malloc(sizeof(byte) * STATE_SIZE);
+    key = (byte *) malloc(sizeof(byte) * KEY_SIZE * (ROUND + 1));
+    
     // key 생성
     for(int i = 0;i < KEY_SIZE;i++){
         byte b = (byte) (rand() % 256);
         key[i] = b;
     }
-
-    
-
-    // const byte tmp[32] = {
-    //     0x4d, 0xc6, 0x9b, 0xde,
-    //     0x76, 0x9b, 0xe5, 0x9d,
-    //     0xba, 0x70, 0x51, 0x75,
-    //     0xe3, 0x92, 0x16, 0x74,
-    //     0x8e, 0xb2, 0xdf, 0x2d,
-    //     0x22, 0xf2, 0x80, 0xc5,
-    //     0xdb, 0xdc, 0xf7, 0x1e,
-    //     0x12, 0x92, 0xc1, 0x52 
-    // };
-
-
 
     // 암호화할 평문 생성
     for(int i = 0;i < STATE_COUNT;i++){
@@ -179,10 +185,12 @@ int main(){
             plaintext[i * 16 + j] = b;
         }
     }
+
+    printf("----------평문\n\n");
     for(int i = 0;i < STATE_SIZE * STATE_COUNT;i++){
         printf("%#04x ", plaintext[i]);
     }
-    printf("\n");
+    printf("\n\n");
     
     byte* device_plaintext;
     byte* device_round_key;
@@ -190,42 +198,93 @@ int main(){
     byte* device_inv_mix_column_matrix;
 
     CUDA_CHECK(cudaMalloc((void **) &device_plaintext, sizeof(byte) * STATE_SIZE * STATE_COUNT));
-    CUDA_CHECK(cudaMalloc((void **) &device_round_key, sizeof(byte) * KEY_SIZE));
+    CUDA_CHECK(cudaMalloc((void **) &device_round_key, sizeof(byte) * KEY_SIZE * (ROUND + 1)));
     CUDA_CHECK(cudaMalloc((void **) &device_sbox, sizeof(byte) * 256));
     CUDA_CHECK(cudaMalloc((void **) &device_inv_sbox, sizeof(byte) * 256));
     CUDA_CHECK(cudaMalloc((void **) &device_mix_column_matrix, sizeof(byte) * 16));
     CUDA_CHECK(cudaMalloc((void **) &device_inv_mix_column_matrix, sizeof(byte) * 16));
 
+    KeyExpansion(key); // 라운드 키를 만든다.
 
-    CUDA_CHECK(cudaMemcpy(device_round_key, key, sizeof(byte) * KEY_SIZE, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(device_round_key, key, sizeof(byte) * KEY_SIZE * (ROUND + 1), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(device_plaintext, plaintext, sizeof(byte) * STATE_SIZE * STATE_COUNT, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(device_sbox, sbox, sizeof(byte) * 256, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(device_inv_sbox, inv_sbox, sizeof(byte) * 256, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(device_mix_column_matrix, mix_column_matrix, sizeof(byte) * 16, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(device_inv_mix_column_matrix, inv_mix_column_matrix, sizeof(byte) * 16, cudaMemcpyHostToDevice));
 
-    dim3 dimBlock(4, 4, 1); // Block당 스레드 수 (4 x 4)16개
+    dim3 dimBlock(4, 4, 1); // Block당 스레드 수 (4 x 4 = 16개)
     
-    AddRoundKey<<<STATE_COUNT, dimBlock>>>(device_plaintext, device_round_key);
+    // 암호화
+    AddRoundKey<<<STATE_COUNT, dimBlock>>>(device_plaintext, device_round_key, 0);
+    CUDA_CHECK(cudaMemcpy(plaintext, device_plaintext, sizeof(byte) * STATE_SIZE * STATE_COUNT, cudaMemcpyDeviceToHost));
+    printf("----------pre-round transformation 암호화 결과\n\n");
+    for(int i = 0;i < STATE_SIZE * STATE_COUNT;i++){
+        printf("%#04x ", plaintext[i]);
+    }
+    printf("\n\n");
+    for(int i = 1;i < ROUND;i++){
+        SubBytes<<<STATE_COUNT, dimBlock>>>(device_plaintext, device_sbox);
+        ShiftRows<<<STATE_COUNT, dimBlock>>>(device_plaintext, false);
+        MixColumns<<<STATE_COUNT, dimBlock>>>(device_plaintext, device_mix_column_matrix);    
+        AddRoundKey<<<STATE_COUNT, dimBlock>>>(device_plaintext, device_round_key, i);
+        CUDA_CHECK(cudaMemcpy(plaintext, device_plaintext, sizeof(byte) * STATE_SIZE * STATE_COUNT, cudaMemcpyDeviceToHost));
+        printf("----------round %d 암호화 결과\n\n", i);
+        for(int j = 0;j < STATE_SIZE * STATE_COUNT;j++){
+            printf("%#04x ", plaintext[j]);
+        }
+        printf("\n\n");
+    }
+
     SubBytes<<<STATE_COUNT, dimBlock>>>(device_plaintext, device_sbox);
     ShiftRows<<<STATE_COUNT, dimBlock>>>(device_plaintext, false);
-    MixColumns<<<STATE_COUNT, dimBlock>>>(device_plaintext, device_mix_column_matrix);
+    AddRoundKey<<<STATE_COUNT, dimBlock>>>(device_plaintext, device_round_key, ROUND); // 마지막 암호화는 MixColumns 제외
+    
+    // 암호화 결과
     CUDA_CHECK(cudaMemcpy(plaintext, device_plaintext, sizeof(byte) * STATE_SIZE * STATE_COUNT, cudaMemcpyDeviceToHost));
+    printf("----------round 10 암호화 결과\n\n");
     for(int i = 0;i < STATE_SIZE * STATE_COUNT;i++){
         printf("%#04x ", plaintext[i]);
     }
-    printf("\n");
-    MixColumns<<<STATE_COUNT, dimBlock>>>(device_plaintext, device_inv_mix_column_matrix);
+    printf("\n\n");
+
+    // 복호화
+    AddRoundKey<<<STATE_COUNT, dimBlock>>>(device_plaintext, device_round_key, ROUND);
     ShiftRows<<<STATE_COUNT, dimBlock>>>(device_plaintext, true);
     SubBytes<<<STATE_COUNT, dimBlock>>>(device_plaintext, device_inv_sbox);
-    AddRoundKey<<<STATE_COUNT, dimBlock>>>(device_plaintext, device_round_key);
-    
     CUDA_CHECK(cudaMemcpy(plaintext, device_plaintext, sizeof(byte) * STATE_SIZE * STATE_COUNT, cudaMemcpyDeviceToHost));
+    printf("----------round 10 복호화 결과\n\n");
     for(int i = 0;i < STATE_SIZE * STATE_COUNT;i++){
         printf("%#04x ", plaintext[i]);
     }
-    printf("\n");
-    
+    printf("\n\n");
+    for(int i = ROUND - 1;i > 0;i--){
+        AddRoundKey<<<STATE_COUNT, dimBlock>>>(device_plaintext, device_round_key, i);
+        MixColumns<<<STATE_COUNT, dimBlock>>>(device_plaintext, device_inv_mix_column_matrix);
+        ShiftRows<<<STATE_COUNT, dimBlock>>>(device_plaintext, true);
+        SubBytes<<<STATE_COUNT, dimBlock>>>(device_plaintext, device_inv_sbox);
+        CUDA_CHECK(cudaMemcpy(plaintext, device_plaintext, sizeof(byte) * STATE_SIZE * STATE_COUNT, cudaMemcpyDeviceToHost));
+        printf("----------round %d 복호화 결과\n\n", i);
+        for(int j = 0;j < STATE_SIZE * STATE_COUNT;j++){
+            printf("%#04x ", plaintext[j]);
+        }
+        printf("\n\n");
+    }
+    AddRoundKey<<<STATE_COUNT, dimBlock>>>(device_plaintext, device_round_key, 0);
+    CUDA_CHECK(cudaMemcpy(plaintext, device_plaintext, sizeof(byte) * STATE_SIZE * STATE_COUNT, cudaMemcpyDeviceToHost));
+    printf("----------pre-round transformation 복호화 결과\n\n");
+    for(int i = 0;i < STATE_SIZE * STATE_COUNT;i++){
+        printf("%#04x ", plaintext[i]);
+    }
+    printf("\n\n");
+
+    // 복호화 결과
+    CUDA_CHECK(cudaMemcpy(plaintext, device_plaintext, sizeof(byte) * STATE_SIZE * STATE_COUNT, cudaMemcpyDeviceToHost));
+    printf("----------복호화 결과\n\n");
+    for(int i = 0;i < STATE_SIZE * STATE_COUNT;i++){
+        printf("%#04x ", plaintext[i]);
+    }
+    printf("\n\n");
     
     CUDA_CHECK(cudaFree(device_plaintext));
     CUDA_CHECK(cudaFree(device_round_key));
@@ -233,6 +292,7 @@ int main(){
     CUDA_CHECK(cudaFree(device_inv_sbox));
     CUDA_CHECK(cudaFree(device_mix_column_matrix));
     CUDA_CHECK(cudaFree(device_inv_mix_column_matrix));
+
     free(plaintext);
     free(key);
 
