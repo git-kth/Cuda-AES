@@ -66,14 +66,14 @@ const byte rcon[11] = { // Round Key 생성 시(Key Expansion) 필요한 테이�
     0xFF, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36
 };
 
-const byte mix_column_matrix[16] = {
+const byte mix_column_matrix[16] = { // MixColumns 모듈에서 필요한 테이블
     0x02, 0x03, 0x01, 0x01,
     0x01, 0x02, 0x03, 0x01,
     0x01, 0x01, 0x02, 0x03,
     0x03, 0x01, 0x01, 0x02
 };
 
-const byte inv_mix_column_matrix[16] = {
+const byte inv_mix_column_matrix[16] = { // InvMixColumns 모듈에서 필요한 테이블 (역행렬)
     0x0E, 0x0B, 0x0D, 0x09,
     0x09, 0x0E, 0x0B, 0x0D,
     0x0D, 0x09, 0x0E, 0x0B,
@@ -92,7 +92,7 @@ __global__ void SubBytes(byte* plaintext, byte* sbox){
     plaintext[idx] = ret;
 }
 
-__global__ void ShiftRows(byte* plaintext, bool inverse){ // reverse가 True이면 InvShiftRow 모듈이 된다.
+__global__ void ShiftRows(byte* plaintext, bool inverse){ // inverse가 True이면 InvShiftRow 모듈이 된다.
     int idx = (blockDim.x * blockDim.y) * blockIdx.x + threadIdx.y * blockDim.y + threadIdx.x;
     int value = plaintext[idx];
     int shift_y;
@@ -100,7 +100,6 @@ __global__ void ShiftRows(byte* plaintext, bool inverse){ // reverse가 True이�
     else shift_y = (threadIdx.y + threadIdx.x) % 4; // right shift
 
     int idx2 = (blockDim.x * blockDim.y) * blockIdx.x + shift_y * blockDim.y + threadIdx.x;
-    // __syncthreads();
     plaintext[idx2] = value;
 }
 
